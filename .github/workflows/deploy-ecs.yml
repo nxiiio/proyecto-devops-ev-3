@@ -1,27 +1,36 @@
-name: Deploy ECS Fargate
+name: CI/CD ECS Fargate
 
 on:
   push:
-    branches: ["main"]
+    branches:
+      - main
+    paths:
+      - "frontend/**"
+      - "backend/**"
+      - "db/**"
+      - ".github/workflows/deploy-ecs.yml"
   workflow_dispatch:
 
+concurrency:
+  group: ecs-fargate-deploy-main
+  cancel-in-progress: true
+
 env:
-  AWS_REGION: us-east-1
-  AWS_ACCOUNT_ID: "024284060206"
-  ECS_CLUSTER: tienda-perritos-cluster
-  ECS_SERVICE: tienda-perritos-service
-  TASK_DEFINITION: .aws/task-definition.json
-  FRONTEND_REPOSITORY: tienda-frontend
-  BACKEND_REPOSITORY: tienda-backend
-  DB_REPOSITORY: tienda-db
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID || '024284060206' }}
+  ECS_CLUSTER: ${{ vars.ECS_CLUSTER || 'tienda-perritos-cluster' }}
+  ECS_SERVICE: ${{ vars.ECS_SERVICE || 'tienda-perritos-service' }}
+  FRONTEND_REPOSITORY: ${{ vars.FRONTEND_REPOSITORY || 'tienda-frontend' }}
+  BACKEND_REPOSITORY: ${{ vars.BACKEND_REPOSITORY || 'tienda-backend' }}
+  DB_REPOSITORY: ${{ vars.DB_REPOSITORY || 'tienda-db' }}
 
 jobs:
-  deploy:
-    name: Build, push and deploy
+  build-push-deploy:
+    name: Build, push and deploy to ECS
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Configure AWS credentials
@@ -32,49 +41,55 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Validate AWS identity
+        run: |
+          aws sts get-caller-identity
+
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push images
+      - name: Build and push frontend image
+        env:
+          IMAGE_URI: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.FRONTEND_REPOSITORY }}
         run: |
-          REGISTRY=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+          docker build -t "$IMAGE_URI:latest" -t "$IMAGE_URI:${GITHUB_SHA}" ./frontend
+          docker push "$IMAGE_URI:latest"
+          docker push "$IMAGE_URI:${GITHUB_SHA}"
 
-          docker build -t $REGISTRY/$FRONTEND_REPOSITORY:$GITHUB_SHA ./frontend
-          docker build -t $REGISTRY/$BACKEND_REPOSITORY:$GITHUB_SHA ./backend
-          docker build -t $REGISTRY/$DB_REPOSITORY:$GITHUB_SHA ./db
+      - name: Build and push backend image
+        env:
+          IMAGE_URI: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.BACKEND_REPOSITORY }}
+        run: |
+          docker build -t "$IMAGE_URI:latest" -t "$IMAGE_URI:${GITHUB_SHA}" ./backend
+          docker push "$IMAGE_URI:latest"
+          docker push "$IMAGE_URI:${GITHUB_SHA}"
 
-          docker push $REGISTRY/$FRONTEND_REPOSITORY:$GITHUB_SHA
-          docker push $REGISTRY/$BACKEND_REPOSITORY:$GITHUB_SHA
-          docker push $REGISTRY/$DB_REPOSITORY:$GITHUB_SHA
+      - name: Build and push database image
+        env:
+          IMAGE_URI: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.DB_REPOSITORY }}
+        run: |
+          docker build -t "$IMAGE_URI:latest" -t "$IMAGE_URI:${GITHUB_SHA}" ./db
+          docker push "$IMAGE_URI:latest"
+          docker push "$IMAGE_URI:${GITHUB_SHA}"
 
-      - name: Render frontend image in task definition
-        id: render-frontend
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
-        with:
-          task-definition: ${{ env.TASK_DEFINITION }}
-          container-name: frontend
-          image: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.FRONTEND_REPOSITORY }}:${{ github.sha }}
+      - name: Force new ECS deployment
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --force-new-deployment
 
-      - name: Render backend image in task definition
-        id: render-backend
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
-        with:
-          task-definition: ${{ steps.render-frontend.outputs.task-definition }}
-          container-name: backend
-          image: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.BACKEND_REPOSITORY }}:${{ github.sha }}
+      - name: Wait for ECS service stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE"
 
-      - name: Render database image in task definition
-        id: render-db
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
-        with:
-          task-definition: ${{ steps.render-backend.outputs.task-definition }}
-          container-name: db
-          image: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.DB_REPOSITORY }}:${{ github.sha }}
-
-      - name: Deploy to ECS
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
-        with:
-          task-definition: ${{ steps.render-db.outputs.task-definition }}
-          service: ${{ env.ECS_SERVICE }}
-          cluster: ${{ env.ECS_CLUSTER }}
-          wait-for-service-stability: true
+      - name: Deployment summary
+        run: |
+          echo "### ECS deployment completed" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Cluster: $ECS_CLUSTER" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Service: $ECS_SERVICE" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Frontend image: $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$FRONTEND_REPOSITORY:$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Backend image: $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$BACKEND_REPOSITORY:$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          echo "- DB image: $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$DB_REPOSITORY:$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
